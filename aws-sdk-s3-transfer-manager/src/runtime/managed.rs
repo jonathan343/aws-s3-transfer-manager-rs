@@ -154,6 +154,18 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     }
 }
 
+/// An HTTP client with its own connection pool, as each managed thread owns one.
+fn build_thread_http_client(
+    resolver: ShufflingDnsResolver<aws_smithy_dns::HickoryDnsResolver>,
+) -> SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        // .tls_provider(aws_smithy_http_client::tls::Provider::S2nTls)
+        .build_with_resolver(resolver)
+}
+
 /// Execution runtime backed by per-core OS threads, each running a tokio
 /// current-thread runtime.
 pub(crate) struct ManagedThreadRuntime {
@@ -237,12 +249,7 @@ impl ManagedThreadRuntime {
 
                         // Create per-thread HTTP client on this thread's runtime.
                         // The TLS connector and connection pool bind to this thread's reactor.
-                        let http_client = aws_smithy_http_client::Builder::new()
-                            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-                            ))
-                            // .tls_provider(aws_smithy_http_client::tls::Provider::S2nTls)
-                            .build_with_resolver(resolver);
+                        let http_client = build_thread_http_client(resolver);
 
                         let _ = tx.send((rt.handle().clone(), http_client));
                         MANAGED_THREAD_CPU.set(Some(cpu_index));
@@ -274,12 +281,22 @@ impl ManagedThreadRuntime {
         let per_thread_clients: Arc<Vec<SharedHttpClient>> =
             Arc::new(threads.iter().map(|th| th.http_client.clone()).collect());
 
-        let shared_http_client = http_client_fn(move |settings, components| {
-            let cpu_index = MANAGED_THREAD_CPU
-                .with(|c| c.get())
-                .expect("http_client_fn called from non-managed thread");
-            per_thread_clients[cpu_index].http_connector(settings, components)
-        });
+        // Requests normally run on managed threads, but a few are issued by the caller directly
+        // (e.g. `UploadHandle::abort` sends `AbortMultipartUpload` from the task that awaits it).
+        // Those use a separate client, built on first use, whose connections bind to the caller's
+        // runtime rather than to a managed thread's reactor.
+        let fallback_http_client: Arc<std::sync::OnceLock<SharedHttpClient>> = Arc::default();
+        let shared_http_client =
+            http_client_fn(move |settings, components| {
+                match MANAGED_THREAD_CPU.with(|c| c.get()) {
+                    Some(cpu_index) => {
+                        per_thread_clients[cpu_index].http_connector(settings, components)
+                    }
+                    None => fallback_http_client
+                        .get_or_init(|| build_thread_http_client(dns_resolver.clone()))
+                        .http_connector(settings, components),
+                }
+            });
 
         let mut components = RuntimeComponents::default();
         components.set_http_client(shared_http_client);
@@ -432,9 +449,15 @@ impl ExecutionRuntime for ManagedThreadRuntime {
 impl Drop for ManagedThreadRuntime {
     fn drop(&mut self) {
         self.shutdown_token.cancel();
+        let current = std::thread::current().id();
         for th in &self.threads {
             if let Some(jh) = th.join_handle.lock().unwrap().take() {
-                let _ = jh.join();
+                // The last reference to the client can be released by work finishing on one of
+                // its own threads. That thread cannot join itself; it exits on its own once the
+                // cancelled shutdown token lets its runtime return.
+                if jh.thread().id() != current {
+                    let _ = jh.join();
+                }
             }
         }
     }

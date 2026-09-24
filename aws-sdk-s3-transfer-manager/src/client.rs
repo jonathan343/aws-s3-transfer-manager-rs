@@ -572,6 +572,58 @@ mod tests {
         );
     }
 
+    /// Regression: the scheduler's skiplists reclaim removed nodes lazily (epoch-based), so a
+    /// node that still owned its descriptor kept the transfer, and through it this `Handle` and
+    /// its worker threads, alive after the client was dropped.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_released_after_transfers() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        use aws_smithy_mocks::{mock, mock_client, RuleMode};
+
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+        let client = Client::new(crate::Config::builder().client(s3_client).build());
+        let weak = Arc::downgrade(&client.handle);
+
+        for i in 0..3 {
+            client
+                .upload()
+                .bucket("bucket")
+                .key(format!("key-{i}"))
+                .body(crate::io::InputStream::from(vec![0u8; 16]))
+                .initiate()
+                .unwrap()
+                .join()
+                .await
+                .unwrap();
+        }
+        // A transfer cancelled while queued is released too.
+        let cancelled = client
+            .upload()
+            .bucket("bucket")
+            .key("cancelled")
+            .body(crate::io::InputStream::from(vec![0u8; 16]))
+            .initiate()
+            .unwrap();
+        cancelled.abort().await.unwrap();
+
+        drop(client);
+        // Work that just finished may still hold the handle for a moment on a worker thread.
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "dropping the last client after its transfers must release the handle"
+        );
+    }
+
     // --- concurrency resolution wiring ---
 
     use crate::runtime::platform::MachineProfile;

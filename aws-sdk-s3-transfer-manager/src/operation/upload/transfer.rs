@@ -279,12 +279,18 @@ impl UploadTransfer {
     }
 
     async fn execute_create_mpu(&self) -> WorkOutcome {
-        let outcome = self.do_execute_create_mpu().await;
-        // unblock any waiters that CreateMPU is complete (success or failure)
-        self.inner.create_mpu_complete.notify_waiters();
-        // state changed - try to wake if we were pending
-        self.inner.ctx.try_wake();
-        outcome
+        /// Unblocks waiters on CreateMPU (success, failure, or interruption by cancellation,
+        /// which drops this future before it returns; `UploadHandle::abort` waits on it).
+        struct NotifyOnDrop<'a>(&'a UploadTransfer);
+        impl Drop for NotifyOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.inner.create_mpu_complete.notify_waiters();
+                // state changed - try to wake if we were pending
+                self.0.inner.ctx.try_wake();
+            }
+        }
+        let _notify = NotifyOnDrop(self);
+        self.do_execute_create_mpu().await
     }
 
     async fn do_execute_create_mpu(&self) -> WorkOutcome {

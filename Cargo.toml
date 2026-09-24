@@ -8,3 +8,6 @@ members = [
     "benches",
     "integration-tests"
 ]
+# The Python bindings are a standalone cdylib built with maturin; keeping them out of the
+# workspace keeps workspace-wide jobs (sanitizers, feature powerset, etc.) free of PyO3.
+exclude = ["bindings/python"]

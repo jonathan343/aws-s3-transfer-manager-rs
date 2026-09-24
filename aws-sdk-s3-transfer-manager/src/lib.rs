@@ -104,7 +104,7 @@ pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
 pub use self::config::S3ClientConfig;
-pub use self::transfer::SchedulingCtl;
+pub use self::transfer::{SchedulingCtl, TransferMonitor};
 
 /// Create a config loader
 pub fn from_env() -> ConfigLoader {

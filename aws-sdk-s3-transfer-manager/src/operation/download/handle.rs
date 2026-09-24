@@ -121,6 +121,11 @@ impl DownloadHandleInner {
         self.transfer.ctx().scheduling()
     }
 
+    /// Owned view of this transfer; see [`TransferMonitor`](crate::TransferMonitor).
+    pub(crate) fn monitor(&self) -> crate::TransferMonitor {
+        self.transfer.ctx().monitor()
+    }
+
     /// Get I/O controls for this transfer.
     pub(crate) fn io_ctl(&self) -> DownloadIoCtl<'_> {
         DownloadIoCtl {
@@ -292,6 +297,12 @@ impl DownloadHandle {
         self.inner.scheduling()
     }
 
+    /// A [`TransferMonitor`](crate::TransferMonitor) for observing this transfer
+    /// (status, metrics, scheduling, completion) independently of this handle.
+    pub fn monitor(&self) -> crate::TransferMonitor {
+        self.inner.monitor()
+    }
+
     /// Runtime I/O controls for this download.
     ///
     /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
@@ -412,6 +423,12 @@ impl ManagedDownloadHandle {
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
+    }
+
+    /// A [`TransferMonitor`](crate::TransferMonitor) for observing this transfer
+    /// (status, metrics, scheduling, completion) independently of this handle.
+    pub fn monitor(&self) -> crate::TransferMonitor {
+        self.inner.monitor()
     }
 
     /// Runtime I/O controls for this download.

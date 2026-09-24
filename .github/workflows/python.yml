@@ -1,0 +1,162 @@
+name: Python bindings
+
+on:
+  pull_request:
+    paths:
+      - "bindings/python/**"
+      - "aws-sdk-s3-transfer-manager/**"
+      - ".github/workflows/python.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bindings/python/**"
+      - "aws-sdk-s3-transfer-manager/**"
+      - ".github/workflows/python.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the built distributions to PyPI"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+  UV_LOCKED: 1
+
+defaults:
+  run:
+    shell: bash
+    working-directory: bindings/python
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/python -> ../../target
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - run: uv sync
+      - name: ruff
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: mypy (strict)
+        run: uv run mypy
+      - name: stubs match the extension module
+        run: uv run python -m mypy.stubtest aws_s3_transfer_manager._core
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-2022]
+        python: ["3.10", "3.14"]
+        include:
+          # Free-threaded CPython is built without the stable ABI and tested separately.
+          - os: ubuntu-24.04
+            python: "3.14t"
+          - os: macos-14
+            python: "3.14t"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/python -> ../../target
+          key: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --no-group lint
+      - run: uv run pytest
+
+  wheels:
+    name: wheels (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64, manylinux: "2_28" }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { name: macos-x86_64, runner: macos-14, target: x86_64 }
+          - { name: macos-arm64, runner: macos-14, target: aarch64 }
+          - { name: windows-x86_64, runner: windows-2022, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: ${{ !startsWith(matrix.platform.name, 'linux') }}
+        with:
+          python-version: |
+            3.10
+            3.14t
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux || 'auto' }}
+          # One stable-ABI (abi3) wheel for CPython 3.10+, plus one for free-threaded 3.14t.
+          args: --profile dist --out dist --interpreter 3.10 3.14t
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.name }}
+          path: bindings/python/dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: bindings/python/dist
+
+  publish:
+    name: publish to PyPI
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: [lint, test, wheels, sdist]
+    runs-on: ubuntu-24.04
+    # Trusted publishing: the PyPI project must list this repository, workflow, and environment.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

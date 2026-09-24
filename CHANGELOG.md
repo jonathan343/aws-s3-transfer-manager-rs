@@ -23,6 +23,21 @@ beneath it is new.
 - Resilience: recovery from download body-stream failures the SDK's own retry does not cover,
   throttle-storm recovery with per-bucket retry isolation, and speculative hedging of slow requests
   under a self-limiting budget.
+- `TransferMonitor`, returned by every transfer handle's `monitor()`: a cloneable view of a running
+  transfer's status, metrics and scheduling controls, whose `finished()` waits for the transfer to end
+  without consuming the handle, so progress can be reported while another task joins it.
+
+### Fixed
+- Cancelling a transfer (dropping its handle or calling `abort()`) now interrupts its in-flight
+  work; previously work already dispatched ran to completion, so cancelling a large upload could
+  keep uploading every part in flight.
+- `UploadHandle::abort()` no longer panics when the client uses the managed runtime's HTTP
+  transport: requests issued from outside the managed threads (such as `AbortMultipartUpload`)
+  use a separate connection pool.
+- Dropping the last `Client` after it ran transfers now shuts down its worker threads. Finished
+  transfers were kept alive by scheduler queue entries awaiting epoch-based reclamation, which
+  kept the client and its threads alive; and when the last reference was released by a worker
+  thread, shutdown tried to join that thread with itself.
 
 ### Changed
 - Execution model: the transfer manager now runs its own per-core threads and dispatches work to

@@ -185,7 +185,25 @@ struct GroupQueue {
     /// Atomic coordination state (member count, root presence, vruntime).
     state: GroupState,
     /// Members of this group, ordered by individual vruntime.
-    inner: SkipMap<ReadyKey, TransferDescriptor>,
+    inner: SkipMap<ReadyKey, Member>,
+}
+
+/// A queued descriptor, taken out of its skiplist node when popped.
+///
+/// A `SkipMap` frees removed nodes only once epoch-based reclamation gets to them, which is
+/// never guaranteed (an idle process may not reclaim at all). A node still owning its
+/// descriptor would keep the transfer, and through its context the client `Handle` and its
+/// worker threads, alive after the transfer ended and the client was dropped.
+struct Member(parking_lot::Mutex<Option<TransferDescriptor>>);
+
+impl Member {
+    fn new(descriptor: TransferDescriptor) -> Self {
+        Self(parking_lot::Mutex::new(Some(descriptor)))
+    }
+
+    fn take(&self) -> Option<TransferDescriptor> {
+        self.0.lock().take()
+    }
 }
 
 impl GroupQueue {
@@ -206,7 +224,7 @@ impl GroupQueue {
     fn insert(&self, descriptor: TransferDescriptor) -> usize {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
-        self.inner.insert(key, descriptor);
+        self.inner.insert(key, Member::new(descriptor));
         self.state.enqueue()
     }
 
@@ -216,7 +234,12 @@ impl GroupQueue {
         let entry = self.inner.pop_front()?;
         self.state.dequeue();
         self.state.advance_min_vruntime(entry.key().vruntime);
-        Some(entry.value().clone())
+        entry.value().take()
+    }
+
+    /// Pop every member, releasing their descriptors.
+    fn drain(&self) {
+        while self.pop().is_some() {}
     }
 
     /// Number of members currently queued in this group.
@@ -436,32 +459,39 @@ impl ReadySet {
     /// poll outcome is handled. This is what guarantees at most one
     /// worker is inside `poll_work` for any given transfer at a time.
     pub(super) fn pop(&self) -> Option<TransferDescriptor> {
-        let entry = self.groups.pop_front()?;
-        let group_key = *entry.key();
-        let group = entry.value().clone();
+        loop {
+            let entry = self.groups.pop_front()?;
+            let group_key = *entry.key();
+            let group = entry.value().clone();
 
-        let descriptor = group.pop()?;
+            let descriptor = group.pop();
 
-        // Mark group as not in root tree (we just popped it out).
-        group.state.exit_root();
+            // Mark group as not in root tree (we just popped it out).
+            group.state.exit_root();
 
-        // Update root min_vruntime (monotonically increasing)
-        self.min_vruntime
-            .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
+            // Update root min_vruntime (monotonically increasing)
+            self.min_vruntime
+                .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
 
-        // Re-insert group if it still has members, using CAS to
-        // coordinate with concurrent insert_child's 0->1 path.
-        // Only the thread that wins the CAS adds the group to the
-        // root tree, preventing duplicate entries.
-        if group.count() > 0 && group.state.try_enter_root() {
-            let new_key = GroupKey {
-                group_vruntime: group.group_vruntime(),
-                group_id: group_key.group_id,
-            };
-            self.groups.insert(new_key, group);
+            // Re-insert group if it still has members, using CAS to
+            // coordinate with concurrent insert_child's 0->1 path.
+            // Only the thread that wins the CAS adds the group to the
+            // root tree, preventing duplicate entries.
+            if group.count() > 0 && group.state.try_enter_root() {
+                let new_key = GroupKey {
+                    group_vruntime: group.group_vruntime(),
+                    group_id: group_key.group_id,
+                };
+                self.groups.insert(new_key, group);
+            }
+
+            match descriptor {
+                Some(descriptor) => return Some(descriptor),
+                // The group was emptied concurrently (see `remove_group`); later
+                // groups may still have work.
+                None => continue,
+            }
         }
-
-        Some(descriptor)
     }
 
     /// Test-only helper: advance a group's `group_vruntime` by `units`.
@@ -487,7 +517,10 @@ impl ReadySet {
     /// `parent = Some(group_id)` will return `Err(OrphanedChild)`.
     pub(super) fn remove_group(&self, group_id: u64) {
         let removed = self.by_group.write().unwrap().remove(&group_id);
-        if removed.is_some() {
+        if let Some(group) = removed {
+            // Release queued (cancelled) members now: the group itself may outlive this call
+            // in a root-tree node awaiting reclamation (see `Member`).
+            group.drain();
             // Linear scan of root tree to find and remove the entry for this group.
             // Acceptable because remove_group is called once per top-level transfer
             // lifetime (terminal path only), not on the hot scheduling path.

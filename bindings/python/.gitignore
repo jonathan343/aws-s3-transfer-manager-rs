@@ -1,0 +1,12 @@
+# Python environments and caches
+.venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Build output: the extension module maturin places next to the Python sources for editable
+# installs, and built distributions.
+python/aws_s3_transfer_manager/*.so
+python/aws_s3_transfer_manager/*.pyd
+dist/

@@ -499,6 +499,9 @@ pub(crate) struct TransferContext {
     error: Arc<Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
+    /// Multi-waiter form of the completion signal, observed through
+    /// [`TransferMonitor::finished`]. Flipped to `true` by `signal_terminal`.
+    terminal: Arc<tokio::sync::watch::Sender<bool>>,
     /// Set when poll_work returns Pending, cleared on try_wake
     wake_flag: Arc<wake_flag::WakeFlag>,
     /// Cancellation token for cooperative cancellation
@@ -556,6 +559,7 @@ impl TransferContext {
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
+            terminal: Arc::new(tokio::sync::watch::Sender::new(false)),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
@@ -577,6 +581,7 @@ impl TransferContext {
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
+            terminal: Arc::new(tokio::sync::watch::Sender::new(false)),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
@@ -701,11 +706,16 @@ impl TransferContext {
         self.status.set_completed()
     }
 
-    /// Mark transfer as cancelled.
+    /// Mark transfer as cancelled, and interrupt its in-flight work at the next await point
+    /// (the execute path selects on the cancellation token).
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        self.status.set_cancelled()
+        let set = self.status.set_cancelled();
+        if set {
+            self.cancellation_token.cancel();
+        }
+        set
     }
 
     /// Take the error if transfer failed. Returns None if not failed or already taken.
@@ -764,6 +774,7 @@ impl TransferContext {
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
+        self.terminal.send_replace(true);
         // Wake the parent transfer (if any) so it can reap this child.
         if let Some(parent_id) = self.id.parent {
             self.handle.scheduler.wake(TransferId {
@@ -824,6 +835,84 @@ impl TransferContext {
     /// Get scheduling controls for this transfer.
     pub(crate) fn scheduling(&self) -> SchedulingCtl<'_> {
         SchedulingCtl { ctx: self }
+    }
+
+    /// An owned, cloneable view of this transfer for callers outside its handle.
+    pub(crate) fn monitor(&self) -> TransferMonitor {
+        TransferMonitor { ctx: self.clone() }
+    }
+}
+
+/// A cloneable view of an in-progress transfer that does not own it.
+///
+/// Obtained from the `monitor()` method of any transfer handle (for example
+/// [`UploadHandle::monitor()`]). A handle is consumed by `join()` or `abort()`, so it
+/// cannot report on the transfer while it is being awaited; a monitor can. It exposes
+/// the transfer's status, metrics and scheduling controls, and [`finished`](Self::finished)
+/// waits for the transfer to reach a terminal state without consuming anything, so one
+/// task can report progress while another owns the handle.
+///
+/// A monitor does not keep a transfer running: dropping the handle still cancels it.
+///
+/// ```no_run
+/// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+/// let handle = client.download_objects()
+///     .bucket("my-bucket")
+///     .destination("/tmp/my-bucket")
+///     .initiate()?;
+///
+/// let monitor = handle.monitor();
+/// let progress = tokio::spawn(async move {
+///     loop {
+///         tokio::select! {
+///             _ = monitor.finished() => break,
+///             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+///                 println!("{} bytes received", monitor.metrics().network_rx);
+///             }
+///         }
+///     }
+/// });
+///
+/// handle.join().await?;
+/// # let _ = progress.await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`UploadHandle::monitor()`]: crate::operation::upload::UploadHandle::monitor
+#[derive(Debug, Clone)]
+pub struct TransferMonitor {
+    ctx: TransferContext,
+}
+
+impl TransferMonitor {
+    /// Current status of the transfer.
+    pub fn status(&self) -> crate::types::TransferStatus {
+        self.ctx.transfer_status()
+    }
+
+    /// Snapshot of current transfer metrics.
+    pub fn metrics(&self) -> crate::types::TransferMetrics {
+        self.ctx.metrics()
+    }
+
+    /// Get scheduling controls for the transfer.
+    ///
+    /// See [`SchedulingCtl`] for available controls.
+    pub fn scheduling(&self) -> SchedulingCtl<'_> {
+        self.ctx.scheduling()
+    }
+
+    /// Wait until the transfer reaches a terminal state: completed, failed, or cancelled.
+    ///
+    /// Resolves immediately if it already has. This only observes the transition; the
+    /// outcome (and any completion work, such as moving a downloaded file into place) is
+    /// still obtained by calling `join()` on the handle, which returns promptly once this
+    /// has resolved.
+    pub async fn finished(&self) {
+        let mut terminal = self.ctx.terminal.subscribe();
+        // `Err` means every `TransferContext` clone is gone, which leaves nothing to wait for.
+        let _ = terminal.wait_for(|finished| *finished).await;
     }
 }
 
@@ -996,6 +1085,50 @@ mod tests {
                 ctx.transfer_status(),
                 crate::types::TransferStatus::Cancelled
             );
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn monitor_finished_waits_for_terminal_signal() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            let monitor = ctx.monitor();
+            let waiter = tokio::spawn({
+                let monitor = monitor.clone();
+                async move { monitor.finished().await }
+            });
+
+            // A terminal status alone is not the transition; only the signal is.
+            ctx.set_completed();
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished());
+
+            ctx.signal_terminal();
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .expect("finished() must resolve once the transfer signals terminal")
+                .unwrap();
+            assert_eq!(monitor.status(), crate::types::TransferStatus::Completed);
+            assert!(monitor.metrics().finished_at.is_some());
+
+            // Waiting after the fact resolves immediately, as often as it is asked.
+            monitor.finished().await;
+            monitor.finished().await;
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn monitor_outliving_transfer_does_not_hang() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            let monitor = ctx.monitor();
+            drop(ctx);
+            // The monitor's own clone keeps the signal alive, so it must still be
+            // resolved by an explicit signal rather than by the sender dropping.
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(50), monitor.finished())
+                    .await;
+            assert!(pending.is_err(), "no terminal signal was sent");
+            monitor.ctx.signal_terminal();
+            monitor.finished().await;
         }
 
         #[cfg_attr(miri, ignore)]

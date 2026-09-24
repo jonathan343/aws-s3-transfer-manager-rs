@@ -134,6 +134,12 @@ impl UploadObjectsHandle {
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
+
+    /// A [`TransferMonitor`](crate::TransferMonitor) for observing this transfer
+    /// (status, metrics, scheduling, completion) independently of this handle.
+    pub fn monitor(&self) -> crate::TransferMonitor {
+        self.transfer.ctx().monitor()
+    }
 }
 
 impl Drop for UploadObjectsHandle {

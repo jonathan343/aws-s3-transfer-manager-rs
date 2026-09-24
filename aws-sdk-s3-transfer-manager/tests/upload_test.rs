@@ -1284,3 +1284,39 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
         "source should be the underlying CompleteMultipartUpload SdkError"
     );
 }
+
+/// A monitor observes the transfer while another task owns (and joins) the handle:
+/// `finished()` resolves without consuming anything, and the monitor keeps reporting
+/// the final status and metrics after the handle is gone.
+#[tokio::test]
+async fn test_monitor_observes_upload_owned_elsewhere() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from(vec![0u8; 1024]))
+        .initiate()
+        .unwrap();
+    let monitor = handle.monitor();
+
+    tokio::time::timeout(Duration::from_secs(5), monitor.finished())
+        .await
+        .expect("upload must reach a terminal state");
+    assert_eq!(
+        monitor.status(),
+        aws_sdk_s3_transfer_manager::types::TransferStatus::Completed
+    );
+
+    let output = tokio::spawn(handle.join()).await.unwrap().unwrap();
+    assert_eq!(output.e_tag(), Some("test-etag"));
+    assert_eq!(monitor.metrics().network_tx, 1024);
+    assert!(monitor.metrics().finished_at.is_some());
+}
